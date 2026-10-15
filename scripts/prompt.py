@@ -4,8 +4,9 @@
     echo "Ein Satz pro Zeile." | python scripts/prompt.py --config config/eval/wmt14.yaml
     python scripts/prompt.py --config config/eval/wmt14.yaml            # interactive prompt
     python scripts/prompt.py --config config/eval/wmt14.yaml --show-levels "Guten Morgen!"
+    python scripts/prompt.py --config config/eval/xsum.yaml < article.txt   # articles separated by blank lines
 """
-import argparse, os, sys
+import argparse, os, re, sys
 import torch
 from omegaconf import OmegaConf
 
@@ -26,6 +27,7 @@ ap.add_argument("--top_k", type=int, default=None)
 ap.add_argument("--top_p", type=float, default=None)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--show-levels", action="store_true", help="also decode the partial output after every level, coarse to fine")
+ap.add_argument("--raw", action="store_true", help="XSum: feed the text as-is instead of one sentence per line")
 a = ap.parse_args()
 
 CFG = OmegaConf.load(a.config)
@@ -46,7 +48,11 @@ net.load_state_dict(torch.load(os.path.join(ck, CFG.checkpoints.generator), map_
 net.eval()
 src_tok = AutoTokenizer.from_pretrained(str(CFG.tokenizer.pre_tokenizer.model_id))
 EOS, PAD = tk.pre_tokenizer.eos_token_id, tk.pre_tokenizer.pad_token_id
+# the source prefix is padded with the model's own pad id (XSum: 50257), which can differ from the output pad id
+PREFIX_PAD = int(CFG.model.get("prefix_pad_token_id", PAD))
 vq = tk.vqvae.vq
+# XSum articles are one sentence per line; run-on paragraphs give degenerate summaries
+DOCS = CFG.task == "xsum"
 
 
 def dec(ids):
@@ -70,12 +76,19 @@ def level_zhats(idx):
     return out
 
 
+def prepare(text):
+    text = re.sub(r"\s*\n\s*", "\n", text.strip())
+    if DOCS and not a.raw:
+        text = re.sub(r"(?<!\bMr)(?<!\bMs)(?<!\bDr)(?<!\bSt)(?<!\bMrs)(?<!\bProf)([.!?][\"'\u201d\u2019)]?)[ \t]+(?=[\"\u201c\u2018'(A-Z0-9])", r"\1\n", text)
+    return text
+
+
 @torch.no_grad()
 def generate(text):
-    ids = src_tok(text)["input_ids"]
+    ids = src_tok(prepare(text))["input_ids"]
     if len(ids) > P:
         print(f"  (input is {len(ids)} tokens; the model sees only the first {P})", file=sys.stderr)
-    x = torch.tensor([(ids[:P] + [PAD] * P)[:P]], device=DEV)
+    x = torch.tensor([(ids[:P] + [PREFIX_PAD] * P)[:P]], device=DEV)
     torch.manual_seed(a.seed)
     g = net.generate(None, x, temperature=temp, top_k=top_k, top_p=top_p, cfg_scale=cfg, cfg_null_eos=EOS)
     if a.show_levels:
@@ -89,9 +102,11 @@ if a.text:
     for t in a.text:
         print(generate(t))
 elif not sys.stdin.isatty():
-    for line in sys.stdin:
-        if line.strip():
-            print(generate(line.strip()), flush=True)
+    # WMT14: one sentence per line; XSum: one article per blank-line-separated block
+    chunks = re.split(r"\n\s*\n", sys.stdin.read()) if DOCS else sys.stdin.read().splitlines()
+    for chunk in chunks:
+        if chunk.strip():
+            print(generate(chunk), flush=True)
 else:
     print("enter text, empty line or Ctrl-D to quit", file=sys.stderr)
     while True:

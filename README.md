@@ -79,6 +79,8 @@ To try a text-to-text checkpoint (WMT14, XSum) on your own input, pass text as a
 python scripts/prompt.py --config config/eval/wmt14.yaml --cfg 1.0 --show-levels "Die Katze schläft auf dem Sofa."
 ```
 
+XSum expects one sentence per line, as in its training data; `prompt.py` splits sentences for you (`--raw` to skip that) and reads piped stdin as articles separated by blank lines.
+
 ## Evaluation
 
 Download the checkpoints and evaluation inputs:
