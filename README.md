@@ -65,6 +65,14 @@ pip install -r requirements.txt
 
 Python 3.10 or newer and a CUDA-capable PyTorch installation are recommended.
 
+### Apple silicon (MPS)
+
+Without CUDA, `evaluate.py` runs a single shard on the Mac GPU (MPS), falling back to CPU. Set `NCM_DEVICE` to force a device (`mps`, `cpu`, `cuda:1`, ...). MPS has no float64, so the frequency-penalty decoding path uses float32 there.
+
+```bash
+python evaluate.py --config config/eval/wmt14.yaml --checkpoint-dir artifacts/wmt14 --data-dir data/wmt14 --n 64
+```
+
 ## Evaluation
 
 Download the checkpoints and evaluation inputs:
