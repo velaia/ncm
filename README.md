@@ -73,6 +73,12 @@ Without CUDA, `evaluate.py` runs a single shard on the Mac GPU (MPS), falling ba
 python evaluate.py --config config/eval/wmt14.yaml --checkpoint-dir artifacts/wmt14 --data-dir data/wmt14 --n 64
 ```
 
+To try a text-to-text checkpoint (WMT14, XSum) on your own input, pass text as arguments, pipe lines in, or run without input for an interactive prompt; `--show-levels` prints the output after every level, coarse to fine:
+
+```bash
+python scripts/prompt.py --config config/eval/wmt14.yaml --cfg 1.0 --show-levels "Die Katze schläft auf dem Sofa."
+```
+
 ## Evaluation
 
 Download the checkpoints and evaluation inputs:
