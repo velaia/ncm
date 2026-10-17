@@ -9,7 +9,7 @@
 # A failed run leaves the instance up so it can be fixed and re-run over ssh (remote.sh skips finished steps);
 # when DONE, results are copied and the instance is held until MAX_MINUTES unless HOLD=0. Stopping this
 # script (Ctrl-C/SIGTERM) destroys the instance.
-# Env: MAX_MINUTES (default 180) destroys the instance after that long no matter what; KEEP=1 skips the destroy.
+# Env: SWEEP=1 adds the precision/compile sweep; MAX_MINUTES (default 180) destroys the instance after that long no matter what; KEEP=1 skips the destroy.
 set -euo pipefail
 IMAGE=${IMAGE:-pytorch/pytorch:2.14.1-cuda12.6-cudnn9-runtime}
 DISK=${DISK:-40}
@@ -35,7 +35,7 @@ run) OFFER=${2:?usage: launch.sh run OFFER_ID}
 *) sed -n 2,10p "$0"; exit 1 ;;
 esac
 
-ONSTART="nohup bash -c 'mkdir -p /workspace && cd /workspace && (command -v git || (apt-get update -qq && apt-get install -y -qq git)) >/dev/null 2>&1 && git clone -q -b $BRANCH https://github.com/velaia/ncm.git ncm && BRANCH=$BRANCH bash ncm/scripts/vast/remote.sh' >/workspace/onstart.log 2>&1 &"
+ONSTART="nohup bash -c 'mkdir -p /workspace && cd /workspace && (command -v git || (apt-get update -qq && apt-get install -y -qq git)) >/dev/null 2>&1 && git clone -q -b $BRANCH https://github.com/velaia/ncm.git ncm && BRANCH=$BRANCH SWEEP=${SWEEP:-0} bash ncm/scripts/vast/remote.sh' >/workspace/onstart.log 2>&1 &"
 ID=$(vastai create instance "$OFFER" --image "$IMAGE" --disk "$DISK" --ssh --direct --cancel-unavail \
        --label ncm-kv-bench --onstart-cmd "$ONSTART" --raw | python3 -c "import json,sys; print(json.load(sys.stdin)['new_contract'])")
 echo "instance $ID created (offer $OFFER); billing has started"
