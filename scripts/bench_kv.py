@@ -2,12 +2,17 @@
 
     python scripts/bench_kv.py --config config/eval/wmt14.yaml                    # paper protocol: 1024 inputs, batch 16
     python scripts/bench_kv.py --config config/eval/xsum.yaml --n 256 --bs 64 --cfg 0.5
+    python scripts/bench_kv.py --config config/eval/wmt14.yaml --modes eager,kv,kv-bf16,kv-cudagraph,kv-bf16-cudagraph
+
+A mode is "eager" or "kv" plus optional "-"-joined parts: tf32 | bf16 | fp16 (autocast; VQ decoding stays fp32)
+and compile | autotune | cudagraph (torch.compile of the per-level transformer step with mode default |
+max-autotune-no-cudagraphs | reduce-overhead). Compiled modes get extra warmup batches, so compile time is excluded.
 
 Each mode runs the same inputs once after a warmup batch. Timing covers generation plus decoding to
 token ids (no detokenization or scoring). Prints throughput, peak device memory, the share of outputs
 identical to the uncached run, and the task metric (BLEU for wmt14, ROUGE-L for xsum, solved % for sudoku).
 """
-import argparse, json, os, pickle, sys, time
+import argparse, contextlib, json, os, pickle, sys, time
 import torch
 from omegaconf import OmegaConf
 
@@ -25,7 +30,7 @@ ap.add_argument("--data-dir", default="")
 ap.add_argument("--n", type=int, default=1024)
 ap.add_argument("--bs", type=int, default=16)
 ap.add_argument("--cfg", type=float, default=None)
-ap.add_argument("--modes", default="eager,kv", help="comma-separated subset of eager,kv")
+ap.add_argument("--modes", default="eager,kv", help="comma-separated modes, see above")
 ap.add_argument("--json", default="", help="also write results to this file")
 a = ap.parse_args()
 
@@ -81,10 +86,41 @@ def dec(ids):
     return tk.pre_tokenizer.decode([t for t in ids if t not in (EOS, PAD)], skip_special_tokens=True)
 
 
+COMPILE_MODES = {"compile": "default", "autotune": "max-autotune-no-cudagraphs", "cudagraph": "reduce-overhead"}
+DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+for k in ("cache_size_limit", "recompile_limit"):  # one graph per level shape
+    if hasattr(torch._dynamo.config, k):
+        setattr(torch._dynamo.config, k, 64)
+
+
+def setup(mode):
+    """Configure net for a mode; returns (use_kv_cache, autocast context, torch.compile mode or None)."""
+    parts = mode.split("-")
+    kv = parts[0] == "kv"
+    unknown = set(parts[1:]) - {"tf32"} - set(DTYPES) - set(COMPILE_MODES)
+    assert parts[0] in ("eager", "kv") and not unknown, f"bad mode {mode}"
+    if DEV.startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = "tf32" in parts
+    steps = ("_kv_prefix", "_kv_level") if kv else ("_decode_level_logits",)
+    for name in ("_kv_prefix", "_kv_level", "_decode_level_logits"):
+        net.__dict__.pop(name, None)  # undo a previous mode's compiled wrappers
+    cmode = next((COMPILE_MODES[p] for p in parts if p in COMPILE_MODES), None)
+    if cmode:
+        torch._dynamo.reset()
+        for name in steps:
+            setattr(net, name, torch.compile(getattr(net, name), mode=cmode, dynamic=False))
+    dt = next((DTYPES[p] for p in parts if p in DTYPES), None)
+    amp = torch.autocast(DEV.split(":")[0], dtype=dt) if dt else contextlib.nullcontext()
+    return kv, amp, cmode
+
+
 @torch.no_grad()
-def run(x, kv):
+def run(x, kv, amp=contextlib.nullcontext(), cmode=None):
     torch.manual_seed(0)
-    g = net.generate(None, x, temperature=temp, top_k=top_k, top_p=top_p, cfg_scale=cfg, cfg_null_eos=EOS, use_kv_cache=kv)
+    if cmode == "reduce-overhead":
+        torch.compiler.cudagraph_mark_step_begin()
+    with amp:
+        g = net.generate(None, x, temperature=temp, top_k=top_k, top_p=top_p, cfg_scale=cfg, cfg_null_eos=EOS, use_kv_cache=kv)
     _, zl = tk.vqvae.vq.idx_to_zhats(g, return_zlevels=True)
     return tk.vqvae.decoder(zl[-1]).argmax(-1)
 
@@ -107,22 +143,27 @@ name = torch.cuda.get_device_name() if DEV.startswith("cuda") else DEV
 print(f"[{CFG.task}] device={name} torch={torch.__version__} n={n} bs={a.bs} cfg={cfg}", flush=True)
 results, base = [], None
 for mode in a.modes.split(","):
-    kv = mode == "kv"
-    run(X[:a.bs], kv); sync()  # warmup
+    kv, amp, cmode = setup(mode)
+    tw = time.perf_counter()
+    for _ in range(3 if cmode else 1):  # warmup; compiled modes compile, then record CUDA graphs
+        run(X[:a.bs], kv, amp, cmode)
+    sync(); tw = time.perf_counter() - tw
     reset_peak()
     outs, t = [], time.perf_counter()
     for s in range(0, n, a.bs):
-        outs.append(run(X[s:s + a.bs], kv))
+        outs.append(run(X[s:s + a.bs], kv, amp, cmode))
     sync(); dt = time.perf_counter() - t
     out = torch.cat(outs).cpu()
     base = out if base is None else base
     same = (out == base).all(1).float().mean().item()
     mname, mval = metric([dec(r) for r in out.tolist()])
     r = dict(task=CFG.task, mode=mode, device=name, n=n, bs=a.bs, cfg=cfg, seconds=dt, seq_per_s=n / dt,
-             peak_gb=peak_gb(), identical_to_first=same, metric=mname, score=mval)
+             peak_gb=peak_gb(), identical_to_first=same, metric=mname, score=mval, warmup_s=tw)
     results.append(r)
-    print(f"{mode:6s} {dt:8.2f}s  {n / dt:8.1f} seq/s  peak {r['peak_gb']:5.2f} GB  identical {same:6.1%}  {mname} {mval:.2f}", flush=True)
+    sp = f"  x{results[0]['seconds'] / dt:5.2f}" if len(results) > 1 else ""
+    print(f"{mode:22s} {dt:8.2f}s  {n / dt:8.1f} seq/s  peak {r['peak_gb']:5.2f} GB  identical {same:6.1%}  {mname} {mval:.2f}"
+          f"  warmup {tw:5.1f}s{sp}", flush=True)
 if len(results) == 2:
-    print(f"speedup kv vs eager: {results[0]['seconds'] / results[1]['seconds']:.2f}x")
+    print(f"speedup {results[1]['mode']} vs {results[0]['mode']}: {results[0]['seconds'] / results[1]['seconds']:.2f}x")
 if a.json:
     json.dump(results, open(a.json, "w"), indent=1)

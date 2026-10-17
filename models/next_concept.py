@@ -479,6 +479,20 @@ class NextConceptTransformer(Transformer):
         for block in self.transformer.blocks:
             block.attn.kv_caching(enable)
 
+    # The KV-cached generation path as two side-effect-free steps, so they can be wrapped with torch.compile
+    # (including mode="reduce-overhead", i.e. CUDA graphs) without touching generate().
+    def _kv_prefix(self, h, mask, rope):
+        kv = []
+        for block in self.transformer.blocks:
+            h, k_v = block(h, attn_mask=mask, rope_cos_sin=rope, return_kv=True)
+            kv.append(k_v)
+        return kv
+
+    def _kv_level(self, x, prefix_kv, mask, rope, hidx):
+        for block, k_v in zip(self.transformer.blocks, prefix_kv):
+            x = block(x, attn_mask=mask, rope_cos_sin=rope, past_kv=k_v)
+        return self.lm_heads[hidx](self.transformer.ln_f(x))
+
     def _sample_level(self, logits, temperature, top_k, top_p):
         _c = getattr(self, "_cfg", None)
         if _c is not None and _c["scale"] > 0.0:
@@ -648,65 +662,45 @@ class NextConceptTransformer(Transformer):
         generated_idx = [idx]
         idx_next = idx
         if use_kv_cache:
-            self._set_kv_caching(True)
+            # Prefix K/V are computed once; every level attends over them without re-encoding the prefix.
+            rope_p = (self.rope_cos_gen_0, self.rope_sin_gen_0) if self.use_rope else None
+            pfx_mask = torch.zeros(1, 1, P, P, device=prefix_emb.device)
+            if _pbias is not None:
+                pfx_mask = pfx_mask + _pbias
+            prefix_kv = self._kv_prefix(prefix_emb, pfx_mask, rope_p)
 
-        try:
+        level_acum = self.levels[0] if self.query_level0 else 0
+        for level_idx in range(len(self.levels)-1):
+            if self._cfg is not None:
+                self._cfg["level"] = level_idx + 1
+
+            z_q_level = vq.embeddings[level_idx](idx_next)
+            z_hat, x = vq.get_next_autoregressive_input(level_idx, z_hat, z_q_level)
+
+            if self.use_post_upsample_conv:
+                x = self._apply_post_upsample_conv_single(x, level_idx + (1 - self._lvl_first))
+
+            x = self.transformer.wte(x) + level_pos_embed[:, level_acum:level_acum + self.levels[level_idx+1], :]
+
+            L_cur = self.levels[level_idx + 1]
+            # Heads and RoPE buffers are indexed by absolute level when level 0 occupies slot 0.
+            _hi = level_idx + (1 - self._lvl_first)
+            rope_k = (
+                getattr(self, f'rope_cos_gen_{_hi}'),
+                getattr(self, f'rope_sin_gen_{_hi}'),
+            ) if self.use_rope else None
+
             if use_kv_cache:
-                rope_p = (
-                    self.rope_cos_gen_0, self.rope_sin_gen_0,
-                ) if self.use_rope else None
-                h = prefix_emb
-                pfx_mask = torch.zeros(1, 1, P, P, device=prefix_emb.device)
+                lvl_mask = torch.zeros(1, 1, L_cur, P + L_cur, device=x.device)
                 if _pbias is not None:
-                    pfx_mask = pfx_mask + _pbias
-                for block in self.transformer.blocks:
-                    h = block(h, attn_mask=pfx_mask, rope_cos_sin=rope_p)
-                # cached_v is a view into the fused qkv projection; copy it so that buffer can be freed
-                prefix_kv = [(b.attn.cached_k, b.attn.cached_v.contiguous()) for b in self.transformer.blocks]
-                del h
+                    lvl_mask = lvl_mask + F.pad(_pbias, (0, L_cur))
+                logits = self._kv_level(x, prefix_kv, lvl_mask, rope_k, _hi)
+            else:
+                logits = self._decode_level_logits(x, prefix_emb, level_idx, _pbias, hidx=_hi)
+            idx_next = self._sample_level(logits, temperature, top_k, top_p)
 
-            level_acum = self.levels[0] if self.query_level0 else 0
-            for level_idx in range(len(self.levels)-1):
-                if self._cfg is not None:
-                    self._cfg["level"] = level_idx + 1
-
-                z_q_level = vq.embeddings[level_idx](idx_next)
-                z_hat, x = vq.get_next_autoregressive_input(level_idx, z_hat, z_q_level)
-
-                if self.use_post_upsample_conv:
-                    x = self._apply_post_upsample_conv_single(x, level_idx + (1 - self._lvl_first))
-
-                x = self.transformer.wte(x) + level_pos_embed[:, level_acum:level_acum + self.levels[level_idx+1], :]
-
-                L_cur = self.levels[level_idx + 1]
-                # Heads and RoPE buffers are indexed by absolute level when level 0 occupies slot 0.
-                _hi = level_idx + (1 - self._lvl_first)
-                rope_k = (
-                    getattr(self, f'rope_cos_gen_{_hi}'),
-                    getattr(self, f'rope_sin_gen_{_hi}'),
-                ) if self.use_rope else None
-
-                if use_kv_cache:
-                    lvl_mask = torch.zeros(1, 1, L_cur, P + L_cur, device=x.device)
-                    if _pbias is not None:
-                        lvl_mask = lvl_mask + F.pad(_pbias, (0, L_cur))
-                    for block, (pk, pv) in zip(self.transformer.blocks, prefix_kv):
-                        block.attn.cached_k, block.attn.cached_v = pk, pv
-                        x = block(x, attn_mask=lvl_mask, rope_cos_sin=rope_k)
-                        # drop the prefix+level K/V this block just concatenated; the next level starts from prefix_kv
-                        block.attn.cached_k = block.attn.cached_v = None
-                    x = self.transformer.ln_f(x)
-                    logits = self.lm_heads[_hi](x)
-                    idx_next = self._sample_level(logits, temperature, top_k, top_p)
-                else:
-                    logits = self._decode_level_logits(x, prefix_emb, level_idx, _pbias, hidx=_hi)
-                    idx_next = self._sample_level(logits, temperature, top_k, top_p)
-
-                generated_idx.append(idx_next)
-                level_acum += self.levels[level_idx+1]
-        finally:
-            if use_kv_cache:
-                self._set_kv_caching(False)
+            generated_idx.append(idx_next)
+            level_acum += self.levels[level_idx+1]
 
         out = torch.cat(generated_idx, dim=1)
         if self._cfg is not None:
