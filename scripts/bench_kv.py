@@ -5,7 +5,7 @@
 
 Each mode runs the same inputs once after a warmup batch. Timing covers generation plus decoding to
 token ids (no detokenization or scoring). Prints throughput, peak device memory, the share of outputs
-identical to the uncached run, and the task metric (BLEU for wmt14, ROUGE-L for xsum).
+identical to the uncached run, and the task metric (BLEU for wmt14, ROUGE-L for xsum, solved % for sudoku).
 """
 import argparse, json, os, pickle, sys, time
 import torch
@@ -98,6 +98,8 @@ def metric(hyps):
         from rouge_score import rouge_scorer
         sc = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
         return "ROUGE-L", 100 * sum(sc.score(r, h)["rougeL"].fmeasure for r, h in zip(ref_txt, hyps)) / len(hyps)
+    if CFG.eval.metric == "exact":
+        return "solved%", 100 * sum(h == r for h, r in zip(hyps, ref_txt)) / len(hyps)
     return "-", float("nan")
 
 
