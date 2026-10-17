@@ -579,6 +579,7 @@ class NextConceptTransformer(Transformer):
             level_pos_embed = level_pos_embed + self.wpe(self.wp_1L)
 
         P = self.prefix_len
+        prefix_kv = None
 
         _pbias = None
         if self.prefix_pad_id is not None:
@@ -630,6 +631,16 @@ class NextConceptTransformer(Transformer):
                         x_in = torch.cat([base_q[:, :1], _E0(known).to(base_q.dtype),
                                           base_q[:, t + 2:]], dim=1)
                 idx = torch.cat(codes, dim=1)
+            elif use_kv_cache:
+                # The prefix rows can't attend to the level-0 queries, so their K/V in this pass are the
+                # prefix cache: keep them instead of encoding the prefix again.
+                prefix_kv = []
+                for block in self.transformer.blocks:
+                    h, (k, v) = block(h, attn_mask=m0, rope_cos_sin=rope_0, return_kv=True)
+                    prefix_kv.append((k[:, :, :P], v[:, :, :P]))
+                h = self.transformer.ln_f(h)
+                if self._cfg is not None: self._cfg["level"] = 0
+                idx = self._sample_level(self.lm_heads[0](h[:, P:, :]), temperature, top_k, top_p)
             else:
                 for block in self.transformer.blocks:
                     h = block(h, attn_mask=m0, rope_cos_sin=rope_0)
@@ -644,8 +655,11 @@ class NextConceptTransformer(Transformer):
             pfx_mask = torch.zeros(1, 1, P, P, device=dev)
             if _pbias is not None:
                 pfx_mask = pfx_mask + _pbias
-            for block in self.transformer.blocks:
-                h = block(h, attn_mask=pfx_mask, rope_cos_sin=rope_p)
+            if use_kv_cache:  # this pass is exactly the prefix encoding the cache needs
+                h, prefix_kv = self._kv_prefix(h, pfx_mask, rope_p)
+            else:
+                for block in self.transformer.blocks:
+                    h = block(h, attn_mask=pfx_mask, rope_cos_sin=rope_p)
             h = self.transformer.ln_f(h)
             l0_logits = self.lm_head_l0(self._level0_slice(h, _pm if self.prefix_pad_id is not None else None))
             if self._cfg is not None: self._cfg["level"] = 0
@@ -653,8 +667,8 @@ class NextConceptTransformer(Transformer):
 
         generated_idx = [idx]
         idx_next = idx
-        if use_kv_cache:
-            # Encode the prefix once; every level attends over its K/V instead of re-encoding it.
+        if use_kv_cache and prefix_kv is None:
+            # Level 0 was given: encode the prefix once here; every level attends over its K/V.
             rope_p = (self.rope_cos_gen_0, self.rope_sin_gen_0) if self.use_rope else None
             pfx_mask = torch.zeros(1, 1, P, P, device=prefix_emb.device)
             if _pbias is not None:
