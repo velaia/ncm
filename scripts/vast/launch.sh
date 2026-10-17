@@ -6,11 +6,14 @@
 #   scripts/vast/launch.sh search 4090               # list offers (also: h100, h100sxm)
 #   scripts/vast/launch.sh run <OFFER_ID>            # rent, run, fetch results, destroy
 #
-# Env: MAX_MINUTES (default 90) destroys the instance after that long no matter what; KEEP=1 skips the destroy.
+# A failed run leaves the instance up so it can be fixed and re-run over ssh (remote.sh skips finished steps);
+# when DONE, results are copied and the instance is held until MAX_MINUTES unless HOLD=0. Stopping this
+# script (Ctrl-C/SIGTERM) destroys the instance.
+# Env: MAX_MINUTES (default 180) destroys the instance after that long no matter what; KEEP=1 skips the destroy.
 set -euo pipefail
 IMAGE=${IMAGE:-pytorch/pytorch:2.14.1-cuda12.6-cudnn9-runtime}
 DISK=${DISK:-40}
-MAX_MINUTES=${MAX_MINUTES:-90}
+MAX_MINUTES=${MAX_MINUTES:-180}
 BRANCH=${BRANCH:-mac-mps}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 FILTER="num_gpus=1 verified=true rentable=true reliability>0.98 cuda_vers>=12.6 direct_port_count>=1 inet_down>=200 disk_space>=$DISK"
@@ -46,6 +49,7 @@ destroy() {
     fi
 }
 trap destroy EXIT
+trap 'exit 130' INT TERM
 
 deadline=$(( $(date +%s) + MAX_MINUTES * 60 ))
 status() { vastai show instance "$ID" --raw | python3 -c "import json,sys; print(json.load(sys.stdin).get('actual_status') or 'pending')"; }
@@ -58,19 +62,34 @@ HOSTPORT=${URL#ssh://}; HOST=${HOSTPORT%:*}; PORT=${HOSTPORT##*:}
 SSH=(ssh -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "$HOST")
 echo "running; ssh -p $PORT $HOST   (log: /workspace/results/log.txt)"
 
-state=""
+fetch() {
+    GPU=$("${SSH[@]}" "nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | tr ' ' '_'" 2>/dev/null || echo gpu)
+    DEST="$ROOT/eval/vast/$(date +%Y%m%d-%H%M)-$GPU-$ID"
+    mkdir -p "$DEST"
+    scp -q -P "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -r "$HOST:/workspace/results/*" "$DEST/" || echo "copy failed"
+    "${SSH[@]}" 'cat /workspace/onstart.log' >"$DEST/onstart.log" 2>/dev/null || true
+    echo "results in $DEST"
+}
+
+state="" prev="" noted=""
 while :; do
     [ "$(date +%s)" -lt "$deadline" ] || { echo "MAX_MINUTES=$MAX_MINUTES reached"; break; }
     state=$("${SSH[@]}" 'cd /workspace/results 2>/dev/null && { [ -f DONE ] && echo DONE; [ -f FAILED ] && echo FAILED; tail -n 1 log.txt; }' 2>/dev/null || true)
-    echo "[$(date +%H:%M)] $(echo "$state" | tail -n 1 | cut -c1-150)"
-    case "$state" in DONE*|FAILED*) break ;; esac
+    line=$(echo "$state" | tr '\r' '\n' | grep -v '^ *$' | tail -n 1 | cut -c1-150)
+    [ "$line" = "$prev" ] || echo "[$(date +%H:%M)] $line"; prev=$line
+    case "$state" in
+        DONE*) break ;;
+        FAILED*) [ -n "$noted" ] || echo "[$(date +%H:%M)] FAILED: instance stays up for a fix; re-run: ${SSH[*]} 'cd /workspace && git -C ncm pull -q && nohup bash ncm/scripts/vast/remote.sh >/dev/null 2>&1 &'"
+           noted=1 ;;
+        *) noted="" ;;
+    esac
     sleep 60
 done
+fetch
+if [ "${HOLD:-1}" = 1 ] && [ "$(date +%s)" -lt "$deadline" ]; then
+    echo "holding instance $ID until the ${MAX_MINUTES}-minute limit; stop this script to destroy it now"
+    while [ "$(date +%s)" -lt "$deadline" ]; do sleep 60; done
+    fetch
+fi
 
-GPU=$("${SSH[@]}" "nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | tr ' ' '_'" 2>/dev/null || echo gpu)
-DEST="$ROOT/eval/vast/$(date +%Y%m%d-%H%M)-$GPU-$ID"
-mkdir -p "$DEST"
-scp -q -P "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -r "$HOST:/workspace/results/*" "$DEST/" || echo "copy failed"
-"${SSH[@]}" 'cat /workspace/onstart.log' >"$DEST/onstart.log" 2>/dev/null || true
-echo "results in $DEST"
 grep -h -E "^\[|^eager|^kv|^speedup|BLEU|R-1|^ +[0-9]" "$DEST"/log.txt 2>/dev/null | tail -n 60 || true
