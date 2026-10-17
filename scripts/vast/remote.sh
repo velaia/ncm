@@ -13,6 +13,9 @@ set -e
 echo "=== start $(date -u)"
 
 command -v git >/dev/null || { apt-get update -qq && apt-get install -y -qq git; }
+# pytorch/pytorch images are Ubuntu 24.04 with torch in the system Python (PEP 668); this box is throwaway
+export PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore
+command -v python >/dev/null || ln -s "$(command -v python3)" /usr/local/bin/python
 cd "$WORK"
 [ -d ncm ] || git clone -q -b "$BRANCH" "$REPO" ncm
 cd ncm

@@ -25,7 +25,10 @@ search)
     esac
     vastai search offers "$GPU $FILTER" -o dph | head -15
     exit ;;
-run) OFFER=${2:?usage: launch.sh run OFFER_ID} ;;
+run) OFFER=${2:?usage: launch.sh run OFFER_ID}
+    # the monitor below can't answer a passphrase prompt: refuse to rent until ssh works non-interactively
+    ssh-add -l >/dev/null 2>&1 || ssh-keygen -y -P "" -f ~/.ssh/id_ed25519 >/dev/null 2>&1 || {
+        echo "no usable ssh key: unlock it first with  ssh-add --apple-use-keychain ~/.ssh/id_ed25519"; exit 1; } ;;
 *) sed -n 2,10p "$0"; exit 1 ;;
 esac
 
@@ -52,7 +55,7 @@ until [ "$(status)" = running ]; do
 done
 URL=$(vastai ssh-url "$ID")              # ssh://root@HOST:PORT
 HOSTPORT=${URL#ssh://}; HOST=${HOSTPORT%:*}; PORT=${HOSTPORT##*:}
-SSH=(ssh -p "$PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "$HOST")
+SSH=(ssh -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "$HOST")
 echo "running; ssh -p $PORT $HOST   (log: /workspace/results/log.txt)"
 
 state=""
@@ -67,7 +70,7 @@ done
 GPU=$("${SSH[@]}" "nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | tr ' ' '_'" 2>/dev/null || echo gpu)
 DEST="$ROOT/eval/vast/$(date +%Y%m%d-%H%M)-$GPU-$ID"
 mkdir -p "$DEST"
-scp -q -P "$PORT" -o StrictHostKeyChecking=accept-new -r "$HOST:/workspace/results/*" "$DEST/" || echo "copy failed"
+scp -q -P "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -r "$HOST:/workspace/results/*" "$DEST/" || echo "copy failed"
 "${SSH[@]}" 'cat /workspace/onstart.log' >"$DEST/onstart.log" 2>/dev/null || true
 echo "results in $DEST"
 grep -h -E "^\[|^eager|^kv|^speedup|BLEU|R-1|^ +[0-9]" "$DEST"/log.txt 2>/dev/null | tail -n 60 || true
