@@ -27,6 +27,7 @@ ap.add_argument("--top_k", type=int, default=None)
 ap.add_argument("--top_p", type=float, default=None)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--show-levels", action="store_true", help="also decode the partial output after every level, coarse to fine")
+ap.add_argument("--no-kv-cache", action="store_true", help="re-encode the prefix at every level (slower, same output)")
 ap.add_argument("--raw", action="store_true", help="XSum: feed the text as-is instead of one sentence per line")
 a = ap.parse_args()
 
@@ -90,7 +91,7 @@ def generate(text):
         print(f"  (input is {len(ids)} tokens; the model sees only the first {P})", file=sys.stderr)
     x = torch.tensor([(ids[:P] + [PREFIX_PAD] * P)[:P]], device=DEV)
     torch.manual_seed(a.seed)
-    g = net.generate(None, x, temperature=temp, top_k=top_k, top_p=top_p, cfg_scale=cfg, cfg_null_eos=EOS)
+    g = net.generate(None, x, temperature=temp, top_k=top_k, top_p=top_p, cfg_scale=cfg, cfg_null_eos=EOS, use_kv_cache=not a.no_kv_cache)
     if a.show_levels:
         for li, z in enumerate(level_zhats(g)):
             print(f"  L{li:<2} ({vq.levels[li]:>3} codes) {dec(tk.vqvae.decoder(z).argmax(-1)[0].tolist())}")
