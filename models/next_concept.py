@@ -90,6 +90,11 @@ class NextConceptTransformer(Transformer):
         self._lvl_first = 0 if self.query_level0 else 1
         T = self.L if self.query_level0 else self.L - self.levels[0]
         P = config.prefix_len
+        # Read optional flags once: getattr on a missing DictConfig key raises and swallows an exception whose
+        # traceback cycles back to the caller's frame, so doing it in generate() kept every call's tensors alive
+        # until the cyclic GC ran (GBs per batch on CUDA with the KV cache).
+        self.raw_token_prefix = bool(getattr(config, 'raw_token_prefix', False))
+        self.contextual_prefix = bool(getattr(config, 'contextual_prefix', False))
 
         # Per-level RoPE: prefix at [0..P-1], each target chunk reset to [0..l_k-1].
         self.use_rope = bool(getattr(config, 'use_rope', False))
@@ -546,9 +551,9 @@ class NextConceptTransformer(Transformer):
         if self.use_ctx_encoder:
             prefix_emb = self._encode_context(prefix_tokens[:, :self.prefix_len])
         else:
-            if bool(getattr(self.config, 'raw_token_prefix', False)):
+            if self.raw_token_prefix:
                 _enc = self.vqvae_local[0].encoder
-                if bool(getattr(self.config, 'contextual_prefix', False)) and \
+                if self.contextual_prefix and \
                         len(getattr(_enc, 'blocks', [])) > 0:
                     z_prefix = _enc.forward_nopos(prefix_tokens)[:, :self.prefix_len, :]
                 else:
@@ -656,7 +661,9 @@ class NextConceptTransformer(Transformer):
                     pfx_mask = pfx_mask + _pbias
                 for block in self.transformer.blocks:
                     h = block(h, attn_mask=pfx_mask, rope_cos_sin=rope_p)
-                prefix_kv = [(b.attn.cached_k, b.attn.cached_v) for b in self.transformer.blocks]
+                # cached_v is a view into the fused qkv projection; copy it so that buffer can be freed
+                prefix_kv = [(b.attn.cached_k, b.attn.cached_v.contiguous()) for b in self.transformer.blocks]
+                del h
 
             level_acum = self.levels[0] if self.query_level0 else 0
             for level_idx in range(len(self.levels)-1):
@@ -680,13 +687,14 @@ class NextConceptTransformer(Transformer):
                 ) if self.use_rope else None
 
                 if use_kv_cache:
-                    for blk, (pk, pv) in zip(self.transformer.blocks, prefix_kv):
-                        blk.attn.cached_k, blk.attn.cached_v = pk, pv
                     lvl_mask = torch.zeros(1, 1, L_cur, P + L_cur, device=x.device)
                     if _pbias is not None:
                         lvl_mask = lvl_mask + F.pad(_pbias, (0, L_cur))
-                    for block in self.transformer.blocks:
+                    for block, (pk, pv) in zip(self.transformer.blocks, prefix_kv):
+                        block.attn.cached_k, block.attn.cached_v = pk, pv
                         x = block(x, attn_mask=lvl_mask, rope_cos_sin=rope_k)
+                        # drop the prefix+level K/V this block just concatenated; the next level starts from prefix_kv
+                        block.attn.cached_k = block.attn.cached_v = None
                     x = self.transformer.ln_f(x)
                     logits = self.lm_heads[_hi](x)
                     idx_next = self._sample_level(logits, temperature, top_k, top_p)
