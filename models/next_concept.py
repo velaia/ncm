@@ -652,6 +652,8 @@ class NextConceptTransformer(Transformer):
                 ) if self.use_rope else None
                 h = prefix_emb
                 pfx_mask = torch.zeros(1, 1, P, P, device=prefix_emb.device)
+                if _pbias is not None:
+                    pfx_mask = pfx_mask + _pbias
                 for block in self.transformer.blocks:
                     h = block(h, attn_mask=pfx_mask, rope_cos_sin=rope_p)
                 prefix_kv = [(b.attn.cached_k, b.attn.cached_v) for b in self.transformer.blocks]
@@ -681,6 +683,8 @@ class NextConceptTransformer(Transformer):
                     for blk, (pk, pv) in zip(self.transformer.blocks, prefix_kv):
                         blk.attn.cached_k, blk.attn.cached_v = pk, pv
                     lvl_mask = torch.zeros(1, 1, L_cur, P + L_cur, device=x.device)
+                    if _pbias is not None:
+                        lvl_mask = lvl_mask + F.pad(_pbias, (0, L_cur))
                     for block in self.transformer.blocks:
                         x = block(x, attn_mask=lvl_mask, rope_cos_sin=rope_k)
                     x = self.transformer.ln_f(x)
