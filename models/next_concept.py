@@ -520,8 +520,8 @@ class NextConceptTransformer(Transformer):
     @torch.no_grad()
     def generate(self, idx, prefix_tokens, temperature=1.0, top_k=50, top_p=0.9,
                  use_kv_cache=False, cfg_scale=0.0, cfg_null_eos=50256):
-        assert not (self.query_level0 and use_kv_cache), \
-            "query_level0 generation supports the eager path only"
+        assert not (self.l0_ar and use_kv_cache), \
+            "autoregressive level-0 generation supports the eager path only"
 
         dev = prefix_tokens.device
 
